@@ -768,7 +768,7 @@ def apply_function(function, args, kwargs, execution_state, key,
     start = time()
     try:
         bucket = s3.Bucket(os.environ['DASK_BUCKET'])
-        bucket.put_object(Key=key, Body=pickle.dumps((function, args, kwargs)))
+        bucket.put_object(Key=os.environ['DASK_TASK_PREFIX'] + key, Body=pickle.dumps((function, args, kwargs)))
         payload = {'s3_key': key, 's3_bucket': os.environ['DASK_BUCKET']}
         result = json.loads(lambda_client.invoke(FunctionName='DaskWorker', Payload=json.dumps(payload))['Payload'].read())
     except Exception as e:
@@ -2096,8 +2096,8 @@ class Worker(WorkerBase):
     @gen.coroutine
     def execute(self, key, report=False):
         def lazy_unpickle_from_s3(arg_key):
-            def f():
-                return pickle.loads(boto3.resource('s3').Object(os.environ['DASK_BUCKET'], arg_key).get()['Body'].read())
+            def f(s3_resource):
+                return pickle.loads(s3_resource.Object(os.environ['DASK_BUCKET'], arg_key).get()['Body'].read())
             return f
 
         executor_error = None
@@ -2113,7 +2113,7 @@ class Worker(WorkerBase):
             function, args, kwargs = self.tasks[key]
 
             start = time()
-            data = {k: lazy_unpickle_from_s3('result' + k) for k in self.dependencies[key]}
+            data = {k: lazy_unpickle_from_s3(os.environ['DASK_RESULT_PREFIX'] + k) for k in self.dependencies[key]}
             args2 = pack_data(args, data, key_types=(bytes, unicode))
             kwargs2 = pack_data(kwargs, data, key_types=(bytes, unicode))
             stop = time()
