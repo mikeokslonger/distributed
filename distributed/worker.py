@@ -49,6 +49,13 @@ from .utils import (funcname, get_ip, has_arg, _maybe_complex, log_errors,
                     parse_bytes, parse_timedelta)
 from .utils_comm import pack_data, gather_from_workers
 from .utils_perf import ThrottledGC, enable_gc_diagnosis, disable_gc_diagnosis
+import boto3
+import json
+
+
+boto3_session = boto3.session.Session()
+s3 = boto3_session.resource('s3')
+lambda_client = boto3_session.client('lambda')
 
 _ncores = mp_context.cpu_count()
 
@@ -74,6 +81,8 @@ READY = ('ready', 'constrained')
 
 
 _global_workers = []
+
+
 
 
 class WorkerBase(ServerNode):
@@ -758,7 +767,10 @@ def apply_function(function, args, kwargs, execution_state, key,
     thread_state.key = key
     start = time()
     try:
-        result = function(*args, **kwargs)
+        bucket = s3.Bucket(os.environ['DASK_BUCKET'])
+        bucket.put_object(Key=key, Body=pickle.dumps((function, args, kwargs)))
+        payload = {'s3_key': key, 's3_bucket': os.environ['DASK_BUCKET']}
+        result = json.loads(lambda_client.invoke(FunctionName='DaskWorker', Payload=json.dumps(payload))['Payload'].read())
     except Exception as e:
         msg = error_message(e)
         msg['op'] = 'task-erred'
@@ -2083,6 +2095,11 @@ class Worker(WorkerBase):
 
     @gen.coroutine
     def execute(self, key, report=False):
+        def lazy_unpickle_from_s3(arg_key):
+            def f():
+                return pickle.loads(boto3.resource('s3').Object(os.environ['DASK_BUCKET'], arg_key).get()['Body'].read())
+            return f
+
         executor_error = None
         if self.status in ('closing', 'closed'):
             return
@@ -2096,7 +2113,7 @@ class Worker(WorkerBase):
             function, args, kwargs = self.tasks[key]
 
             start = time()
-            data = {k: self.data[k] for k in self.dependencies[key]}
+            data = {k: lazy_unpickle_from_s3('result' + k) for k in self.dependencies[key]}
             args2 = pack_data(args, data, key_types=(bytes, unicode))
             kwargs2 = pack_data(kwargs, data, key_types=(bytes, unicode))
             stop = time()

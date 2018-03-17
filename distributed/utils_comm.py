@@ -222,4 +222,4 @@ def pack_data(o, d, key_types=object):
     elif typ is dict:
         return {k: pack_data(v, d, key_types=key_types) for k, v in o.items()}
     else:
-        return o
+        return lambda: o
