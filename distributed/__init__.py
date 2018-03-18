@@ -14,7 +14,7 @@ from .scheduler import Scheduler
 from .threadpoolexecutor import rejoin
 from .utils import sync
 from .variable import Variable
-from .worker import Worker, get_worker, get_client, secede, Reschedule
+from .worker import Worker, get_worker, get_client, secede, Reschedule, apply_function_caller_lambda
 from .worker_client import local_client, worker_client
 
 from tornado.gen import TimeoutError

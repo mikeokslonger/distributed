@@ -22,12 +22,12 @@ from .proctitle import enable_proctitle_on_children
 from .security import Security
 from .utils import (get_ip, mp_context, silence_logging, json_load_robust,
         PeriodicCallback)
-from .worker import _ncores, run, parse_memory_limit
+from .worker import _ncores, run, parse_memory_limit, apply_function_caller
 
 
 logger = logging.getLogger(__name__)
 
-
+#TODO FIND WHERE TO PASS IN THE FUNCTION CALLER
 class Nanny(ServerNode):
     """ A process to manage worker processes
 
@@ -43,7 +43,8 @@ class Nanny(ServerNode):
                  name=None, memory_limit='auto', reconnect=True,
                  validate=False, quiet=False, resources=None, silence_logs=None,
                  death_timeout=None, preload=(), preload_argv=[], security=None,
-                 contact_address=None, listen_address=None, **kwargs):
+                 contact_address=None, listen_address=None,
+                 function_caller=apply_function_caller, **kwargs):
         if scheduler_file:
             cfg = json_load_robust(scheduler_file)
             self.scheduler_addr = cfg['address']
@@ -69,7 +70,7 @@ class Nanny(ServerNode):
         assert isinstance(self.security, Security)
         self.connection_args = self.security.get_connection_args('worker')
         self.listen_args = self.security.get_listen_args('worker')
-
+        self.function_caller = function_caller
         self.local_dir = local_dir
 
         self.loop = loop or IOLoop.current()
@@ -209,7 +210,8 @@ class Nanny(ServerNode):
                                    preload=self.preload,
                                    preload_argv=self.preload_argv,
                                    security=self.security,
-                                   contact_address=self.contact_address),
+                                   contact_address=self.contact_address,
+                                   function_caller=self.function_caller),
                 worker_start_args=(start_arg,),
                 silence_logs=self.silence_logs,
                 on_exit=self._on_exit,

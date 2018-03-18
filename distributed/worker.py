@@ -1,14 +1,16 @@
 from __future__ import print_function, division, absolute_import
 
 import bisect
-from collections import defaultdict, deque
+from collections import defaultdict, deque, Iterator
 from datetime import timedelta
+import boto3
 import heapq
 import logging
 import os
 from pickle import PicklingError
 import random
 import threading
+import json
 import sys
 import warnings
 import weakref
@@ -49,13 +51,7 @@ from .utils import (funcname, get_ip, has_arg, _maybe_complex, log_errors,
                     parse_bytes, parse_timedelta)
 from .utils_comm import pack_data, gather_from_workers
 from .utils_perf import ThrottledGC, enable_gc_diagnosis, disable_gc_diagnosis
-import boto3
-import json
 
-
-boto3_session = boto3.session.Session()
-s3 = boto3_session.resource('s3')
-lambda_client = boto3_session.client('lambda')
 
 _ncores = mp_context.cpu_count()
 
@@ -79,10 +75,38 @@ PENDING = ('waiting', 'ready', 'constrained')
 PROCESSING = ('waiting', 'ready', 'constrained', 'executing', 'long-running')
 READY = ('ready', 'constrained')
 
-
 _global_workers = []
+boto3_session = boto3.session.Session()
+s3 = boto3_session.resource('s3')
+lambda_client = boto3_session.client('lambda')
 
 
+def apply_function_caller(f, key, *args, **kwargs):
+    def get_arg(arg):
+        typ = type(arg)
+        if isinstance(arg, Iterator):
+            arg = list(arg)
+        if typ in (list, tuple, set):
+            return typ(map(get_arg, arg))
+        if type(arg) == dict:
+            return dict(zip(arg.keys(), list(map(get_arg, arg.values()))))
+        return arg(None) if callable(arg) else arg
+    return f(*get_arg(args), **get_arg(kwargs))
+
+
+def apply_function_caller_lambda(f, key, *args, **kwargs):
+    """ Run a function with inside a lambda on aws
+
+    Returns
+    -------
+    result: dictionary with information about which bucket and key on s3
+    the results of running the function are stored in
+    """
+    bucket = s3.Bucket(os.environ['DASK_BUCKET'])
+    bucket.put_object(Key=os.environ['DASK_TASK_PREFIX'] + key, Body=pickle.dumps((f, args, kwargs)))
+    payload = {'s3_key': key, 's3_bucket': os.environ['DASK_BUCKET']}
+    result = json.loads(lambda_client.invoke(FunctionName='DaskWorker', Payload=json.dumps(payload))['Payload'].read())
+    return result
 
 
 class WorkerBase(ServerNode):
@@ -92,7 +116,8 @@ class WorkerBase(ServerNode):
                  reconnect=True, memory_limit='auto',
                  executor=None, resources=None, silence_logs=None,
                  death_timeout=None, preload=(), preload_argv=[], security=None,
-                 contact_address=None, memory_monitor_interval='200ms', **kwargs):
+                 contact_address=None, memory_monitor_interval='200ms',
+                 function_caller=apply_function_caller, **kwargs):
 
         self._setup_logging()
 
@@ -114,6 +139,7 @@ class WorkerBase(ServerNode):
         self.preload_argv = preload_argv,
         self.contact_address = contact_address
         self.memory_monitor_interval = parse_timedelta(memory_monitor_interval, default='ms')
+        self.function_caller = function_caller
         if silence_logs:
             silence_logging(level=silence_logs)
 
@@ -751,8 +777,10 @@ def warn_dumps(obj, dumps=pickle.dumps, limit=1e6):
     return b
 
 
-def apply_function(function, args, kwargs, execution_state, key,
-                   active_threads, active_threads_lock, time_delay):
+
+
+def apply_function(function, args, kwargs, execution_state, key, active_threads,
+                   active_threads_lock, time_delay, function_caller):
     """ Run a function, collect information
 
     Returns
@@ -767,10 +795,7 @@ def apply_function(function, args, kwargs, execution_state, key,
     thread_state.key = key
     start = time()
     try:
-        bucket = s3.Bucket(os.environ['DASK_BUCKET'])
-        bucket.put_object(Key=os.environ['DASK_TASK_PREFIX'] + key, Body=pickle.dumps((function, args, kwargs)))
-        payload = {'s3_key': key, 's3_bucket': os.environ['DASK_BUCKET']}
-        result = json.loads(lambda_client.invoke(FunctionName='DaskWorker', Payload=json.dumps(payload))['Payload'].read())
+        result = function_caller(function, key, *args, **kwargs)
     except Exception as e:
         msg = error_message(e)
         msg['op'] = 'task-erred'
@@ -2113,7 +2138,7 @@ class Worker(WorkerBase):
             function, args, kwargs = self.tasks[key]
 
             start = time()
-            data = {k: lazy_unpickle_from_s3(os.environ['DASK_RESULT_PREFIX'] + k) for k in self.dependencies[key]}
+            data = {k: lazy_unpickle_from_s3(os.environ['DASK_RESULT_PREFIX'] + k) if self.function_caller == apply_function_caller_lambda else self.data[k] for k in self.dependencies[key]}
             args2 = pack_data(args, data, key_types=(bytes, unicode))
             kwargs2 = pack_data(kwargs, data, key_types=(bytes, unicode))
             stop = time()
@@ -2129,7 +2154,8 @@ class Worker(WorkerBase):
                                                     self.execution_state, key,
                                                     self.active_threads,
                                                     self.active_threads_lock,
-                                                    self.scheduler_delay)
+                                                    self.scheduler_delay,
+                                                    self.function_caller)
             except RuntimeError as e:
                 executor_error = e
                 raise
